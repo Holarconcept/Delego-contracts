@@ -55,6 +55,9 @@ pub const MAX_AUDIT_PAGE_SIZE: u32 = 20;
 /// effectively disable spending forever with no clear signal, so it is
 /// rejected outright.
 pub const MAX_VELOCITY_INTERVAL: u32 = 6_307_200;
+/// Upper bound on the optional wall-clock velocity floor, in seconds (one
+/// year), mirroring `MAX_VELOCITY_INTERVAL` for the timestamp dimension.
+pub const MAX_VELOCITY_INTERVAL_SECS: u64 = 31_536_000;
 /// Default allowance-decrease timelock in seconds (24 hours).
 pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
 /// Maximum configurable allowance-decrease timelock (30 days).
@@ -542,6 +545,30 @@ pub struct VelocityLimitSetEvent {
     pub set_by: Address,
 }
 
+/// Emitted when the admin configures the wall-clock velocity floor (#290).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VelocityLimitSecsSetEvent {
+    pub previous: Option<u64>,
+    pub current: u64,
+    pub set_by: Address,
+}
+
+/// Velocity state for a single (owner, delegate) pair, returned by
+/// `get_velocity_state` (issue #290).
+///
+/// `min_interval_ledgers` / `last_spend_ledger` drive the authoritative,
+/// drift-free check against `env.ledger().sequence()`. The timestamp fields
+/// are an optional secondary floor that can only make the limiter stricter.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VelocityLimit {
+    pub min_interval_ledgers: u32,
+    pub last_spend_ledger: u32,
+    pub min_interval_secs: u64,
+    pub last_spend_timestamp: u64,
+}
+
 /// Emitted when the expiry of a permission is updated via `update_expiry` (issue #102).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -786,6 +813,11 @@ pub enum DataKey {
     DecreaseTimelockSecs,
     /// Last ledger on which a spend was executed for a (owner, delegate) pair.
     LastSpendLedger(Address, Address),
+    /// Instance-level minimum number of seconds between successive spends,
+    /// checked in addition to `MinSpendInterval` (issue #290).
+    MinSpendIntervalSecs,
+    /// Ledger timestamp of the last spend for a (owner, delegate) pair.
+    LastSpendTimestamp(Address, Address),
     /// Legacy serialized audit log retained for lazy migration.
     AuditLog(Address, Address),
     /// Physical ring-buffer index of a retained audit entry.
@@ -1850,10 +1882,14 @@ impl PermissionsContract {
 
         Self::record_spend_stats(env, owner, delegate, amount);
 
-        // Record the current ledger for velocity tracking.
+        // Record the current ledger sequence and timestamp for velocity tracking.
         env.storage().persistent().set(
             &DataKey::LastSpendLedger(owner.clone(), delegate.clone()),
             &new_spend_ledger,
+        );
+        env.storage().persistent().set(
+            &DataKey::LastSpendTimestamp(owner.clone(), delegate.clone()),
+            &env.ledger().timestamp(),
         );
 
         // Walk the parent chain, deducting the same amount from each ancestor's
@@ -1892,34 +1928,64 @@ impl PermissionsContract {
         })
     }
 
-    /// Rejects a spend when the configured velocity limit (`MinSpendInterval`)
-    /// has not yet elapsed since the last recorded spend ledger for this
-    /// (owner, delegate) pair (issue #54). Called from both `execute_spend`
-    /// and `execute_spend_via_relayer` before the new spend is recorded, so
-    /// direct and relayed spends share the same throttle. No-op when no
-    /// interval has been configured or no prior spend exists.
+    /// Rejects a spend when the configured velocity limit has not yet elapsed
+    /// since the last recorded spend for this (owner, delegate) pair (issues
+    /// #54, #290). Called from both `execute_spend` and
+    /// `execute_spend_via_relayer` before the new spend is recorded, so direct
+    /// and relayed spends share the same throttle.
+    ///
+    /// The primary check is against `env.ledger().sequence()`, which is
+    /// deterministic and immune to validator clock drift: a spend is rejected
+    /// while `current_ledger < last_spend_ledger + min_interval_ledgers`. When
+    /// a wall-clock floor (`MinSpendIntervalSecs`) is also configured, the
+    /// spend must additionally satisfy
+    /// `now >= last_spend_timestamp + min_interval_secs`. The timestamp check
+    /// can only tighten the limiter, never loosen it, so drift cannot be used
+    /// to bypass the ledger interval. No-op when no interval is configured or
+    /// no prior spend exists.
     fn check_velocity(
         env: &Env,
         owner: &Address,
         delegate: &Address,
     ) -> Result<(), PermissionError> {
-        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
-        if let Some(last_ledger) = env
+        let min_interval_ledgers: u32 = env
             .storage()
-            .persistent()
-            .get::<DataKey, u32>(&velocity_key)
-        {
-            if let Some(min_interval) = env
+            .instance()
+            .get(&DataKey::MinSpendInterval)
+            .unwrap_or(0);
+        if min_interval_ledgers > 0 {
+            if let Some(last_ledger) = env
                 .storage()
-                .instance()
-                .get::<DataKey, u32>(&DataKey::MinSpendInterval)
+                .persistent()
+                .get::<DataKey, u32>(&DataKey::LastSpendLedger(owner.clone(), delegate.clone()))
             {
-                let current = env.ledger().sequence();
-                if current < last_ledger + min_interval {
+                // Saturate so a last_ledger near u32::MAX keeps the pair
+                // throttled instead of wrapping around and unlocking it.
+                let next_allowed = last_ledger.saturating_add(min_interval_ledgers);
+                if env.ledger().sequence() < next_allowed {
                     return Err(PermissionError::VelocityLimitExceeded);
                 }
             }
         }
+
+        let min_interval_secs: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinSpendIntervalSecs)
+            .unwrap_or(0);
+        if min_interval_secs > 0 {
+            // Pairs whose last spend predates timestamp tracking have no
+            // recorded timestamp; they are governed by the ledger check alone.
+            if let Some(last_ts) = env.storage().persistent().get::<DataKey, u64>(
+                &DataKey::LastSpendTimestamp(owner.clone(), delegate.clone()),
+            ) {
+                let next_allowed = last_ts.saturating_add(min_interval_secs);
+                if env.ledger().timestamp() < next_allowed {
+                    return Err(PermissionError::VelocityLimitExceeded);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -3072,10 +3138,6 @@ impl PermissionsContract {
         Ok(transitioned)
     }
 
-    /// Configure the minimum number of ledgers that must elapse between successive
-    /// spends for any delegation pair (#324). Admin-only.
-    ///
-    /// Set `interval` to `0` to disable velocity limiting.
     /// Configure the delay before a scheduled allowance decrease can execute.
     /// Admin-only; values are bounded to prevent disabling the security delay.
     pub fn set_decrease_timelock_secs(
@@ -3103,6 +3165,12 @@ impl PermissionsContract {
             .unwrap_or(DEFAULT_DECREASE_TIMELOCK_SECS)
     }
 
+    /// Configure the minimum number of ledgers that must elapse between successive
+    /// spends for any delegation pair (#324). Admin-only.
+    ///
+    /// This is the authoritative velocity check and is evaluated against
+    /// `env.ledger().sequence()` (#290). Set `interval` to `0` to disable
+    /// ledger-based velocity limiting.
     pub fn set_velocity_limit(
         env: Env,
         admin: Address,
@@ -3139,6 +3207,74 @@ impl PermissionsContract {
             .instance()
             .get(&DataKey::MinSpendInterval)
             .unwrap_or(0)
+    }
+
+    /// Configure an optional wall-clock floor, in seconds, between successive
+    /// spends for any delegation pair (#290). Admin-only.
+    ///
+    /// Evaluated against `env.ledger().timestamp()` in addition to the ledger
+    /// sequence interval set by `set_velocity_limit`; a spend must satisfy
+    /// both. Set `secs` to `0` to disable the timestamp floor.
+    pub fn set_velocity_limit_secs(
+        env: Env,
+        admin: Address,
+        secs: u64,
+    ) -> Result<(), PermissionError> {
+        Self::require_admin(&env, &admin)?;
+
+        if secs > MAX_VELOCITY_INTERVAL_SECS {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let previous: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinSpendIntervalSecs);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MinSpendIntervalSecs, &secs);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("velsecset")),
+            VelocityLimitSecsSetEvent {
+                previous,
+                current: secs,
+                set_by: admin,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Returns the configured wall-clock velocity floor in seconds, or `0`
+    /// when none has been set.
+    pub fn get_velocity_limit_secs(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinSpendIntervalSecs)
+            .unwrap_or(0)
+    }
+
+    /// Returns the velocity state for an (owner, delegate) pair (#290).
+    ///
+    /// `last_spend_ledger` / `last_spend_timestamp` are `0` when the pair has
+    /// never spent (or spent before timestamp tracking was introduced).
+    pub fn get_velocity_state(env: Env, owner: Address, delegate: Address) -> VelocityLimit {
+        VelocityLimit {
+            min_interval_ledgers: Self::get_velocity_limit(env.clone()),
+            last_spend_ledger: env
+                .storage()
+                .persistent()
+                .get(&DataKey::LastSpendLedger(owner.clone(), delegate.clone()))
+                .unwrap_or(0),
+            min_interval_secs: Self::get_velocity_limit_secs(env.clone()),
+            last_spend_timestamp: env
+                .storage()
+                .persistent()
+                .get(&DataKey::LastSpendTimestamp(owner, delegate))
+                .unwrap_or(0),
+        }
     }
 
     /// Returns contract name and semantic version for deployment verification (issue #103).

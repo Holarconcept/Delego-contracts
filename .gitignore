@@ -10,13 +10,10 @@ out/
 target/
 
 # Environment
-.env
-.env.local
 .env.*.local
 
 # IDE
 .idea/
-.vscode/
 *.swp
 *.swo
 .DS_Store
@@ -47,3 +44,8 @@ docker-data/
 # Misc
 *.tsbuildinfo
 .turbo/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
+config.bat

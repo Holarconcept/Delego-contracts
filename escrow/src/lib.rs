@@ -444,6 +444,49 @@ pub struct ContractUpgradedEvent {
     pub new_wasm_hash: BytesN<32>,
 }
 
+/// Pending multi-sig contract upgrade (issue #292).
+///
+/// Created by `propose_upgrade`, co-signed via `approve_upgrade`, and applied
+/// by `upgrade` once `approvals` reaches the configured threshold and the
+/// `UPGRADE_TIMELOCK_SECS` timelock measured from `proposed_at` has elapsed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeProposal {
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+}
+
+/// Emitted when an admin proposes a contract upgrade (issue #292).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractUpgradeProposedEvent {
+    pub proposer: Address,
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+    pub threshold: u32,
+}
+
+/// Emitted when an admin approves the pending upgrade proposal.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractUpgradeApprovedEvent {
+    pub approver: Address,
+    pub new_wasm_hash: BytesN<32>,
+    pub approval_count: u32,
+    pub threshold: u32,
+}
+
+/// Emitted when an admin cancels the pending upgrade proposal.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractUpgradeCancelledEvent {
+    pub cancelled_by: Address,
+    pub new_wasm_hash: BytesN<32>,
+}
+
 /// Emitted when the multi-treasury fee distribution is updated (issue #327).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -773,110 +816,124 @@ pub enum DataKey {
     ScheduledFeeUpdate,
     /// Shipment proof for an escrow (required for seller claim on timeout).
     ShipmentProof(u64),
+    /// Current multi-sig upgrade proposal (issue #292).
+    UpgradeProposal,
+    /// M-of-N admin approvals required to execute an upgrade (issue #292).
+    UpgradeThreshold,
 }
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
-/// Canonical ABI numbering for `EscrowError`.
-///
-/// Error codes are part of the contract ABI. They are frozen for the 0.x
-/// deployment line; do not renumber, remove, or reuse existing codes. The
-/// declaration order below is not meaningful — the `#[repr(u32)]` values are.
-///
-/// # Registry
-///
-/// `First version` records the first contract version in which a code is
-/// known to be present. Legacy variants are marked `≤0.2.0` because they
-/// predate this audit; exact pre-0.2.0 introduction releases are not
-/// tracked.
-///
-/// | Code | Variant | First version |
-/// |------|---------|---------------|
-/// | 1 | AlreadyInitialized | ≤0.2.0 |
-/// | 2 | NotFound | ≤0.2.0 |
-/// | 3 | Unauthorized | ≤0.2.0 |
-/// | 4 | AlreadyReleased | ≤0.2.0 |
-/// | 5 | AlreadyRefunded | ≤0.2.0 |
-/// | 6 | InvalidStatus | ≤0.2.0 |
-/// | 7 | TimeoutNotReached | ≤0.2.0 |
-/// | 8 | NotDisputed | ≤0.2.0 |
-/// | 9 | InvalidAmount | ≤0.2.0 |
-/// | 10 | TokenNotWhitelisted | ≤0.2.0 |
-/// | 11 | InsufficientEscrowBalance | ≤0.2.0 |
-/// | 12 | ZeroAmount | ≤0.2.0 |
-/// | 13 | NoPendingTransfer | ≤0.2.0 |
-/// | 14 | InvalidPendingAdmin | ≤0.2.0 |
-/// | 15 | AdminAlreadyExists | ≤0.2.0 |
-/// | 16 | InvalidFeeBps | ≤0.2.0 |
-/// | 17 | AmountBelowMin | ≤0.2.0 |
-/// | 18 | AmountAboveMax | ≤0.2.0 |
-/// | 19 | InvalidLimits | ≤0.2.0 |
-/// | 20 | NotAnArbiter | ≤0.2.0 |
-/// | 21 | AlreadyVoted | ≤0.2.0 |
-/// | 22 | InvalidQuorum | ≤0.2.0 |
-/// | 23 | QuorumNotReached | ≤0.2.0 |
-/// | 24 | QuorumConfigNotSet | ≤0.2.0 |
-/// | 25 | ConflictingQuorum | ≤0.2.0 |
-/// | 26 | CreationPaused | ≤0.2.0 |
-/// | 27 | AlreadyCancelled | ≤0.2.0 |
-/// | 28 | AlreadyFunded | ≤0.2.0 |
-/// | 29 | InvalidExtension | ≤0.2.0 |
-/// | 30 | PoolNotFound | ≤0.2.0 |
-/// | 31 | InsufficientPoolBalance | ≤0.2.0 |
-/// | 32 | InvalidAddress | ≤0.2.0 |
-/// | 33 | InvalidEscrowParticipants | ≤0.2.0 |
-/// | 36 | ReleaseConditionNotSet | ≤0.2.0 |
-/// | 37 | OracleCallFailed | ≤0.2.0 |
-/// | 38 | ConditionNotMet | ≤0.2.0 |
-/// | 39 | InvalidYieldConfig | ≤0.2.0 |
-/// | 40 | AmountLimitsNotSet | ≤0.2.0 |
-/// | 41 | FeeConfigNotSet | ≤0.2.0 |
-/// | 43 | MerchantNotTrading | New |
-/// | 44 | MerchantStatusCheckFailed | New |
-/// | 45 | SignedProofRequired | New |
-/// | 46 | InvalidSignedDeliveryProof | New |
-/// | 47 | OraclePublicKeyNotSet | New |
-/// | 201 | InvalidReleaseRecipient | ≤0.2.0 |
-/// | 400 | MetadataNotSet | next major |
-/// | 401 | InvalidMetadata | next major |
-/// | 402+ | Reserved for new variants | next major |
-///
-/// # Allocating new variants
-///
-/// New variants MUST use codes in the reserved contiguous range starting at
-/// 400. Do not fill historical gaps or reuse codes from the registry above.
-/// | 400+ | Reserved for new variants | next major |
-/// # Cross-contract allocation
-/// The contract error enums (`EscrowError`, `PermissionError`,
-/// `ReputationError`, `DelegationError`, `MarketplaceError`) share a single
-/// numeric ABI space when errors surface over a bridge.  Each contract owns
-/// a disjoint range; the table below is the canonical allocation and is
-/// checked by `error_code_allocation_tests`.
-/// | Contract | Error enum | Allocated range |
-/// |----------|------------|-----------------|
-/// | escrow | `EscrowError` | 400..=999 |
-/// | permission | `PermissionError` | 1_000..=1_999 |
-/// | reputation | `ReputationError` | 2_000..=2_999 |
-/// | delegation | `DelegationError` | 3_000..=3_999 |
-/// | marketplace | `MarketplaceError` | 4_000..=4_999 |
-/// The 0.x codes in the registry above are frozen legacy codes; they predate
-/// this table. New `EscrowError` variants MUST use `400..=999` (or the 1.0
-/// renumbered range) and MUST NOT use another contract's range.
-/// New variants MUST use codes in the escrow allocation (`400..=999`) and
-/// MUST NOT use another contract's range. Do not fill historical gaps or
-/// reuse codes from the registry above.
-///
-/// # Renumber plan
-///
-/// The next `ContractVersion` major bump (1.0.0) is the planned breaking
-/// release for renumbering `EscrowError` contiguously from 1 to N, removing
-/// gaps and sorting declaration order by code. Until that release, the codes
-/// in the registry above are stable.
-/// release for renumbering `EscrowError` contiguously inside the escrow
-/// allocation range (`400..=999`), removing gaps and sorting declaration
-/// order by code. Until that release, the codes in the registry above are
-/// stable.
+// Canonical ABI numbering for `EscrowError`.
+//
+// Error codes are part of the contract ABI. They are frozen for the 0.x
+// deployment line; do not renumber, remove, or reuse existing codes. The
+// declaration order below is not meaningful — the `#[repr(u32)]` values are.
+//
+// # Registry
+//
+// `First version` records the first contract version in which a code is
+// known to be present. Legacy variants are marked `≤0.2.0` because they
+// predate this audit; exact pre-0.2.0 introduction releases are not
+// tracked.
+//
+// | Code | Variant | First version |
+// |------|---------|---------------|
+// | 1 | AlreadyInitialized | ≤0.2.0 |
+// | 2 | NotFound | ≤0.2.0 |
+// | 3 | Unauthorized | ≤0.2.0 |
+// | 4 | AlreadyReleased | ≤0.2.0 |
+// | 5 | AlreadyRefunded | ≤0.2.0 |
+// | 6 | InvalidStatus | ≤0.2.0 |
+// | 7 | TimeoutNotReached | ≤0.2.0 |
+// | 8 | NotDisputed | ≤0.2.0 |
+// | 9 | InvalidAmount | ≤0.2.0 |
+// | 10 | TokenNotWhitelisted | ≤0.2.0 |
+// | 11 | InsufficientEscrowBalance | ≤0.2.0 |
+// | 12 | ZeroAmount | ≤0.2.0 |
+// | 13 | NoPendingTransfer | ≤0.2.0 |
+// | 14 | InvalidPendingAdmin | ≤0.2.0 |
+// | 15 | AdminAlreadyExists | ≤0.2.0 |
+// | 16 | InvalidFeeBps | ≤0.2.0 |
+// | 17 | AmountBelowMin | ≤0.2.0 |
+// | 18 | AmountAboveMax | ≤0.2.0 |
+// | 19 | InvalidLimits | ≤0.2.0 |
+// | 20 | NotAnArbiter | ≤0.2.0 |
+// | 21 | AlreadyVoted | ≤0.2.0 |
+// | 22 | InvalidQuorum | ≤0.2.0 |
+// | 23 | QuorumNotReached | ≤0.2.0 |
+// | 24 | QuorumConfigNotSet | ≤0.2.0 |
+// | 25 | ConflictingQuorum | ≤0.2.0 |
+// | 26 | CreationPaused | ≤0.2.0 |
+// | 27 | AlreadyCancelled | ≤0.2.0 |
+// | 28 | AlreadyFunded | ≤0.2.0 |
+// | 29 | InvalidExtension | ≤0.2.0 |
+// | 30 | PoolNotFound | ≤0.2.0 |
+// | 31 | InsufficientPoolBalance | ≤0.2.0 |
+// | 32 | InvalidAddress | ≤0.2.0 |
+// | 33 | InvalidEscrowParticipants | ≤0.2.0 |
+// | 36 | ReleaseConditionNotSet | ≤0.2.0 |
+// | 37 | OracleCallFailed | ≤0.2.0 |
+// | 38 | ConditionNotMet | ≤0.2.0 |
+// | 39 | InvalidYieldConfig | ≤0.2.0 |
+// | 40 | AmountLimitsNotSet | ≤0.2.0 |
+// | 41 | FeeConfigNotSet | ≤0.2.0 |
+// | 43 | MerchantNotTrading | New |
+// | 44 | MerchantStatusCheckFailed | New |
+// | 45 | SignedProofRequired | New |
+// | 46 | InvalidSignedDeliveryProof | New |
+// | 47 | OraclePublicKeyNotSet | New |
+// | 201 | InvalidReleaseRecipient | ≤0.2.0 |
+// | 400 | MetadataNotSet | next major |
+// | 401 | InvalidMetadata | next major |
+// | 402 | BumpRateLimitExceeded | next major |
+// | 403 | BumpThresholdNotMet | next major |
+// | 404 | ShipmentProofNotFound | next major |
+// | 405 | FeeUpdateNotEffective | next major |
+// | 406 | FeeNoticeWindowNotMet | next major |
+// | 407 | UpgradeProposalExists | next major |
+// | 408 | UpgradeProposalNotFound | next major |
+// | 409 | UpgradeTimelockActive | next major |
+// | 410 | UpgradeHashMismatch | next major |
+// | 411+ | Reserved for new variants | next major |
+//
+// # Allocating new variants
+//
+// New variants MUST use codes in the reserved contiguous range starting at
+// 400. Do not fill historical gaps or reuse codes from the registry above.
+// | 400+ | Reserved for new variants | next major |
+// # Cross-contract allocation
+// The contract error enums (`EscrowError`, `PermissionError`,
+// `ReputationError`, `DelegationError`, `MarketplaceError`) share a single
+// numeric ABI space when errors surface over a bridge.  Each contract owns
+// a disjoint range; the table below is the canonical allocation and is
+// checked by `error_code_allocation_tests`.
+// | Contract | Error enum | Allocated range |
+// |----------|------------|-----------------|
+// | escrow | `EscrowError` | 400..=999 |
+// | permission | `PermissionError` | 1_000..=1_999 |
+// | reputation | `ReputationError` | 2_000..=2_999 |
+// | delegation | `DelegationError` | 3_000..=3_999 |
+// | marketplace | `MarketplaceError` | 4_000..=4_999 |
+// The 0.x codes in the registry above are frozen legacy codes; they predate
+// this table. New `EscrowError` variants MUST use `400..=999` (or the 1.0
+// renumbered range) and MUST NOT use another contract's range.
+// New variants MUST use codes in the escrow allocation (`400..=999`) and
+// MUST NOT use another contract's range. Do not fill historical gaps or
+// reuse codes from the registry above.
+//
+// # Renumber plan
+//
+// The next `ContractVersion` major bump (1.0.0) is the planned breaking
+// release for renumbering `EscrowError` contiguously from 1 to N, removing
+// gaps and sorting declaration order by code. Until that release, the codes
+// in the registry above are stable.
+// release for renumbering `EscrowError` contiguously inside the escrow
+// allocation range (`400..=999`), removing gaps and sorting declaration
+// order by code. Until that release, the codes in the registry above are
+// stable.
+/// Canonical ABI error codes for the escrow contract; see the registry above.
 pub enum EscrowError {
     /// Contract already initialized
     AlreadyInitialized = 1,
@@ -1174,6 +1231,11 @@ const BUMP_BOUNTY_THRESHOLD_LEDGERS: u32 = 17_280; // ~1 day
 const KEEPER_BOUNTY_AMOUNT: i128 = 1_000_000; // 1 XLM equivalent (assuming 7 decimal tokens)
 /// Minimum ledgers of notice required before fee changes take effect.
 const FEE_NOTICE_WINDOW_LEDGERS: u32 = 10_000;
+/// Delay between an upgrade proposal and its earliest execution (48 hours).
+pub const UPGRADE_TIMELOCK_SECS: u64 = 172_800;
+/// Minimum (and default) number of admin approvals required to upgrade, so a
+/// single compromised key can never replace contract code on its own.
+pub const MIN_UPGRADE_THRESHOLD: u32 = 2;
 
 fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
     match record.status {
@@ -1326,7 +1388,160 @@ impl EscrowContract {
         })
     }
 
-    /// Upgrade the contract to new wasm code. Admin-only.
+    /// Set the number of admin approvals (M) required to execute an upgrade.
+    /// Primary-admin only.
+    ///
+    /// The signer set (N) is the primary admin plus all co-admins.
+    /// `threshold` must be at least [`MIN_UPGRADE_THRESHOLD`] and no greater
+    /// than the current signer count. Changing the threshold while a proposal
+    /// is pending is rejected so the bar cannot be lowered mid-flight.
+    pub fn set_upgrade_threshold(
+        env: Env,
+        admin: Address,
+        threshold: u32,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        let primary_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::NotFound)?;
+        if admin != primary_admin {
+            return Err(EscrowError::Unauthorized);
+        }
+        if threshold < MIN_UPGRADE_THRESHOLD || threshold > Self::upgrade_signer_count(&env) {
+            return Err(EscrowError::InvalidQuorum);
+        }
+        if Self::pending_upgrade_proposal(&env).is_some() {
+            return Err(EscrowError::UpgradeProposalExists);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeThreshold, &threshold);
+        Ok(true)
+    }
+
+    /// Number of admin approvals required to execute an upgrade.
+    /// Defaults to [`MIN_UPGRADE_THRESHOLD`] when never configured.
+    pub fn get_upgrade_threshold(env: Env) -> u32 {
+        Self::upgrade_threshold(&env)
+    }
+
+    /// Return the current (pending or last executed) upgrade proposal, if any.
+    pub fn get_upgrade_proposal(env: Env) -> Option<UpgradeProposal> {
+        env.storage().instance().get(&DataKey::UpgradeProposal)
+    }
+
+    /// Propose upgrading the contract to `new_wasm_hash`. Admin or co-admin.
+    ///
+    /// Starts the [`UPGRADE_TIMELOCK_SECS`] timelock and counts as the
+    /// proposer's own approval. Only one unexecuted proposal may exist at a
+    /// time; cancel it first to propose a different hash.
+    pub fn propose_upgrade(
+        env: Env,
+        proposer: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<bool, EscrowError> {
+        proposer.require_auth();
+        if !Self::is_admin(env.clone(), proposer.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        if Self::pending_upgrade_proposal(&env).is_some() {
+            return Err(EscrowError::UpgradeProposalExists);
+        }
+
+        let proposed_at = env.ledger().timestamp();
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(proposer.clone());
+        let proposal = UpgradeProposal {
+            new_wasm_hash: new_wasm_hash.clone(),
+            proposed_at,
+            approvals,
+            executed: false,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal, &proposal);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("upg_prop")),
+            ContractUpgradeProposedEvent {
+                proposer,
+                new_wasm_hash,
+                proposed_at,
+                executable_at: proposed_at.saturating_add(UPGRADE_TIMELOCK_SECS),
+                threshold: Self::upgrade_threshold(&env),
+            },
+        );
+        Ok(true)
+    }
+
+    /// Approve the pending upgrade proposal. Admin or co-admin.
+    ///
+    /// `new_wasm_hash` must match the pending proposal so an approval can
+    /// never be applied to a proposal that was swapped out after review.
+    pub fn approve_upgrade(
+        env: Env,
+        approver: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<bool, EscrowError> {
+        approver.require_auth();
+        if !Self::is_admin(env.clone(), approver.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        let mut proposal =
+            Self::pending_upgrade_proposal(&env).ok_or(EscrowError::UpgradeProposalNotFound)?;
+        if proposal.new_wasm_hash != new_wasm_hash {
+            return Err(EscrowError::UpgradeHashMismatch);
+        }
+        if proposal.approvals.contains(&approver) {
+            return Err(EscrowError::AlreadyVoted);
+        }
+        proposal.approvals.push_back(approver.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal, &proposal);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("upg_appr")),
+            ContractUpgradeApprovedEvent {
+                approver,
+                new_wasm_hash,
+                approval_count: Self::valid_upgrade_approvals(&env, &proposal.approvals),
+                threshold: Self::upgrade_threshold(&env),
+            },
+        );
+        Ok(true)
+    }
+
+    /// Cancel the pending upgrade proposal. Any admin or co-admin may veto.
+    pub fn cancel_upgrade(env: Env, caller: Address) -> Result<bool, EscrowError> {
+        caller.require_auth();
+        if !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+        let proposal =
+            Self::pending_upgrade_proposal(&env).ok_or(EscrowError::UpgradeProposalNotFound)?;
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("upg_cncl")),
+            ContractUpgradeCancelledEvent {
+                cancelled_by: caller,
+                new_wasm_hash: proposal.new_wasm_hash,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Execute the pending multi-sig upgrade to `new_wasm_hash`. Admin or
+    /// co-admin (issue #292).
+    ///
+    /// Requires a pending proposal for the same hash, at least
+    /// `get_upgrade_threshold()` approvals from addresses that are *still*
+    /// admins, and that [`UPGRADE_TIMELOCK_SECS`] has elapsed since the
+    /// proposal was submitted. A single key can therefore never replace the
+    /// contract code unilaterally.
     ///
     /// Persistent storage (escrows, admin list, fee config, …) is keyed by
     /// contract instance and is unaffected by an upgrade — only the
@@ -1343,6 +1558,24 @@ impl EscrowContract {
         if !Self::is_admin(env.clone(), admin.clone()) {
             return Err(EscrowError::Unauthorized);
         }
+
+        let mut proposal =
+            Self::pending_upgrade_proposal(&env).ok_or(EscrowError::UpgradeProposalNotFound)?;
+        if proposal.new_wasm_hash != new_wasm_hash {
+            return Err(EscrowError::UpgradeHashMismatch);
+        }
+        if env.ledger().timestamp() < proposal.proposed_at.saturating_add(UPGRADE_TIMELOCK_SECS) {
+            return Err(EscrowError::UpgradeTimelockActive);
+        }
+        if Self::valid_upgrade_approvals(&env, &proposal.approvals) < Self::upgrade_threshold(&env)
+        {
+            return Err(EscrowError::QuorumNotReached);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal, &proposal);
 
         let previous_semver = Self::version(env.clone()).semver;
 
@@ -5118,6 +5351,42 @@ impl EscrowContract {
             .get(&DataKey::AdminList)
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
         admin_list.contains(&address)
+    }
+
+    /// Configured upgrade threshold, defaulting to [`MIN_UPGRADE_THRESHOLD`].
+    fn upgrade_threshold(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeThreshold)
+            .unwrap_or(MIN_UPGRADE_THRESHOLD)
+    }
+
+    /// Size of the upgrade signer set: the primary admin plus co-admins.
+    fn upgrade_signer_count(env: &Env) -> u32 {
+        let co_admins: soroban_sdk::Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminList)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        let has_primary = env.storage().instance().has(&DataKey::Admin);
+        co_admins.len() + u32::from(has_primary)
+    }
+
+    /// The stored upgrade proposal, if it has not been executed yet.
+    fn pending_upgrade_proposal(env: &Env) -> Option<UpgradeProposal> {
+        env.storage()
+            .instance()
+            .get::<DataKey, UpgradeProposal>(&DataKey::UpgradeProposal)
+            .filter(|p| !p.executed)
+    }
+
+    /// Count approvals from addresses that are still admins, so approvals
+    /// from since-removed co-admins do not count toward the threshold.
+    fn valid_upgrade_approvals(env: &Env, approvals: &Vec<Address>) -> u32 {
+        approvals
+            .iter()
+            .filter(|a| Self::is_admin(env.clone(), a.clone()))
+            .count() as u32
     }
 
     // ── Ticket 1: clear_release_condition ────────────────────────────────────
